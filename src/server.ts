@@ -629,9 +629,10 @@ export default async function plugin(bb: BbPluginApi) {
       reasoningLevel: BbReasoningLevel;
       serviceTier?: BbServiceTier;
     },
+    consume: (raw: string) => Promise<GenerationResult>,
     signal?: AbortSignal,
-  ): Promise<string> => {
-    if (signal?.aborted) return "";
+  ): Promise<GenerationResult> => {
+    if (signal?.aborted) return consume("");
     const worker = await bb.sdk.threads.spawn({
       projectId: thread.projectId,
       environment: thread.environmentId
@@ -652,17 +653,17 @@ export default async function plugin(bb: BbPluginApi) {
     });
 
     try {
-      if (signal?.aborted) return "";
+      if (signal?.aborted) return await consume("");
       await bb.sdk.threads.wait({
         threadId: worker.id,
         status: "idle",
         timeoutMs: WORKER_TIMEOUT_MS,
         signal,
       });
-      if (signal?.aborted) return "";
-      return (
+      if (signal?.aborted) return await consume("");
+      return await consume(
         (await bb.sdk.threads.output({ threadId: worker.id, signal })).output ??
-        ""
+        "",
       );
     } finally {
       await disposeWorker(worker.id);
@@ -721,56 +722,63 @@ export default async function plugin(bb: BbPluginApi) {
     }
     if (signal?.aborted) return result("aborted", turns);
     if (automatic && !config.auto) return result("automatic_disabled", turns);
-    const raw = await runWorker(beforeWorker, input, execution, signal);
-    if (signal?.aborted) return result("aborted", turns);
-    const summary = cleanRecapText(raw);
-    if (summary === "") return result("empty_model_response", turns);
+    return runWorker(
+      beforeWorker,
+      input,
+      execution,
+      async (raw) => {
+        if (signal?.aborted) return result("aborted", turns);
+        const summary = cleanRecapText(raw);
+        if (summary === "") return result("empty_model_response", turns);
 
-    const current = (await bb.sdk.threads.get({
-      threadId,
+        const current = (await bb.sdk.threads.get({
+          threadId,
+          signal,
+        })) as ThreadSnapshot;
+        if (!isVisibleThread(current.visibility))
+          return result("hidden_thread", turns);
+        if (
+          current.status !== "idle" ||
+          (expectedEpoch !== undefined && state.epoch !== expectedEpoch) ||
+          (await hasRunningChildThreads(threadId, signal))
+        ) {
+          return result("stale", turns);
+        }
+        const latestRows = await readTimeline(threadId, signal);
+        const latestTurns = countUserTurns(latestRows, threadId);
+        if (signal?.aborted) return result("aborted", latestTurns);
+        if (latestTurns !== turns || latestUserRowId(latestRows, threadId) !== cursor)
+          return result("stale", latestTurns);
+        if (automatic && hasRecapForCursor(threadId, cursor)) {
+          return { ...result("already_exists", turns), generated: true };
+        }
+
+        const suppressed =
+          automatic &&
+          (raw.length > 500 ||
+            (summary.endsWith("…") && summary.length >= MAX_RECAP_CHARS));
+        const recap = saveRecap(
+          threadId,
+          suppressed ? "" : summary,
+          automatic,
+          turns,
+          `${execution.providerId}/${execution.model}`,
+          suppressed,
+          cursor,
+        );
+        if (automatic) state.lastAutoUserRowId = cursor;
+        if (suppressed)
+          return {
+            recap: null,
+            generated: true,
+            suppressed: true,
+            reason: "suppressed",
+            turns,
+          };
+        return { recap, generated: true, suppressed: false, reason: null, turns };
+      },
       signal,
-    })) as ThreadSnapshot;
-    if (!isVisibleThread(current.visibility))
-      return result("hidden_thread", turns);
-    if (
-      current.status !== "idle" ||
-      (expectedEpoch !== undefined && state.epoch !== expectedEpoch) ||
-      (await hasRunningChildThreads(threadId, signal))
-    ) {
-      return result("stale", turns);
-    }
-    const latestRows = await readTimeline(threadId, signal);
-    const latestTurns = countUserTurns(latestRows, threadId);
-    if (signal?.aborted) return result("aborted", latestTurns);
-    if (latestTurns !== turns || latestUserRowId(latestRows, threadId) !== cursor)
-      return result("stale", latestTurns);
-    if (automatic && hasRecapForCursor(threadId, cursor)) {
-      return { ...result("already_exists", turns), generated: true };
-    }
-
-    const suppressed =
-      automatic &&
-      (raw.length > 500 ||
-        (summary.endsWith("…") && summary.length >= MAX_RECAP_CHARS));
-    const recap = saveRecap(
-      threadId,
-      suppressed ? "" : summary,
-      automatic,
-      turns,
-      `${execution.providerId}/${execution.model}`,
-      suppressed,
-      cursor,
     );
-    if (automatic) state.lastAutoUserRowId = cursor;
-    if (suppressed)
-      return {
-        recap: null,
-        generated: true,
-        suppressed: true,
-        reason: "suppressed",
-        turns,
-      };
-    return { recap, generated: true, suppressed: false, reason: null, turns };
   };
 
   const beginGeneration = (
