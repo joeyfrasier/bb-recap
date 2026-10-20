@@ -795,6 +795,26 @@ function SettingsSectionBody() {
               className="mt-0.5 h-4 w-4 accent-foreground"
             />
           </div>
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <p className="font-medium text-foreground">Disposable recap workers</p>
+              <p id="disposable-workers-help" className="text-xs text-muted-foreground">
+                Requires provider support. Saved recaps and BB history remain available. Worker context cannot resume after release.
+              </p>
+            </div>
+            <input
+              type="checkbox"
+              aria-label="Disposable recap workers"
+              aria-describedby="disposable-workers-help"
+              checked={draft.disposableWorkers}
+              disabled={settingsSaving}
+              onChange={(event) => {
+                const disposableWorkers = checkboxFromInput(event);
+                updateDraft((current) => ({ ...current, disposableWorkers }));
+              }}
+              className="mt-0.5 h-4 w-4 shrink-0 accent-foreground"
+            />
+          </div>
           <div className="grid gap-4 sm:grid-cols-2">
             <label className="space-y-1.5">
               <span className="block font-medium text-foreground">Idle delay (seconds)</span>

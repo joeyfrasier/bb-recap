@@ -65,17 +65,6 @@ const recapSchema = z
   .strict();
 export type Recap = z.infer<typeof recapSchema>;
 
-type BbReasoningLevel =
-  | "none"
-  | "low"
-  | "medium"
-  | "high"
-  | "xhigh"
-  | "max"
-  | "ultra"
-  | "ultracode";
-type BbServiceTier = "default" | "fast";
-
 const modelSelectionSchema = z
   .object({
     providerId: z.string().min(1).max(MAX_ID_CHARS),
@@ -106,6 +95,7 @@ const recapSettingsSchema = z
   .object({
     auto: z.boolean(),
     autoCleanup: z.boolean(),
+    disposableWorkers: z.boolean().default(false),
     afterSeconds: z.number().int().min(0).max(86_400),
     minTurns: z.number().int().min(1).max(100),
     maxConcurrent: z
@@ -251,6 +241,22 @@ function isRecapEventTarget(thread: ThreadSnapshot, pluginId: string): boolean {
 }
 
 type ProviderCatalog = Awaited<ReturnType<BbPluginApi["sdk"]["providers"]["models"]>>;
+
+type WorkerExecution = ModelSelection & {
+  experimental_providerSessionLifetime?: "disposable";
+};
+type WorkerSpawnArgs = Parameters<BbPluginApi["sdk"]["threads"]["spawn"]>[0] & {
+  experimental_providerSessionLifetime?: "disposable";
+};
+const disposableProviderSchema = z.object({
+  capabilities: z.object({ experimental_supportsDisposableSessions: z.literal(true) }),
+});
+const disposableWorkerSchema = z.object({
+  experimental_providerSessionLifetime: z.literal("disposable"),
+});
+const disposableUnsupportedErrorSchema = z.object({
+  code: z.literal("disposable_sessions_unsupported"),
+});
 
 function normalizeModelSelection(
   selection: ModelSelection,
@@ -571,8 +577,9 @@ export default async function plugin(bb: BbPluginApi) {
 
   const resolveExecution = async (
     thread: ThreadSnapshot,
+    disposableWorkers: boolean,
     signal?: AbortSignal,
-  ) => {
+  ): Promise<WorkerExecution | null> => {
     const preferred = modelSelection ?? (await mainDefaultSelection(signal));
     if (!preferred) throw new Error("No default BB model is available.");
 
@@ -604,36 +611,49 @@ export default async function plugin(bb: BbPluginApi) {
     const provider = catalog.providers.find(
       (candidate) => candidate.id === providerId,
     );
-    return normalizeModelSelection(preferred, modelInfo, provider);
+    if (disposableWorkers && !disposableProviderSchema.safeParse(provider).success)
+      return null;
+    return {
+      ...normalizeModelSelection(preferred, modelInfo, provider),
+      ...(disposableWorkers
+        ? { experimental_providerSessionLifetime: "disposable" as const }
+        : {}),
+    };
   };
 
   const disposeWorker = async (threadId: string) => {
-    try {
-      await bb.sdk.threads.archive({ threadId });
-    } catch {
-      // The worker may already have failed or been archived.
+    let archived = false;
+    let stopped = false;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      if (!archived) {
+        try {
+          await bb.sdk.threads.archive({ threadId });
+          archived = true;
+        } catch {}
+      }
+      if (!stopped) {
+        try {
+          await bb.sdk.threads.stop({ threadId });
+          stopped = true;
+        } catch {}
+      }
+      if (archived && stopped) return;
     }
-    try {
-      await bb.sdk.threads.stop({ threadId });
-    } catch {
-      // Stopping is best effort after the result has been collected.
-    }
+    logWarning(`Recap worker cleanup incomplete for ${threadId}. Archive ${archived ? "confirmed" : "unconfirmed"}; stop ${stopped ? "confirmed" : "unconfirmed"}. Any saved recap remains available.`);
   };
 
   const runWorker = async (
     thread: ThreadSnapshot,
     input: { transcript: string; previousRecap?: string },
-    execution: {
-      providerId: string;
-      model: string;
-      reasoningLevel: BbReasoningLevel;
-      serviceTier?: BbServiceTier;
-    },
+    execution: WorkerExecution,
     consume: (raw: string) => Promise<GenerationResult>,
     signal?: AbortSignal,
   ): Promise<GenerationResult> => {
     if (signal?.aborted) return consume("");
-    const worker = await bb.sdk.threads.spawn({
+    const spawnArgs: WorkerSpawnArgs = {
+      ...(execution.experimental_providerSessionLifetime
+        ? { experimental_providerSessionLifetime: execution.experimental_providerSessionLifetime }
+        : {}),
       projectId: thread.projectId,
       environment: thread.environmentId
         ? { type: "reuse", environmentId: thread.environmentId }
@@ -650,10 +670,24 @@ export default async function plugin(bb: BbPluginApi) {
         input.transcript,
         input.previousRecap,
       ),
-    });
+    };
+    let worker: Awaited<ReturnType<BbPluginApi["sdk"]["threads"]["spawn"]>>;
+    try {
+      worker = await bb.sdk.threads.spawn(spawnArgs);
+    } catch (error) {
+      if (
+        execution.experimental_providerSessionLifetime &&
+        disposableUnsupportedErrorSchema.safeParse(error).success
+      ) return result("disposable_workers_unsupported");
+      throw error;
+    }
 
     try {
       if (signal?.aborted) return await consume("");
+      if (
+        execution.experimental_providerSessionLifetime &&
+        !disposableWorkerSchema.safeParse(worker).success
+      ) return result("disposable_workers_unsupported");
       await bb.sdk.threads.wait({
         threadId: worker.id,
         status: "idle",
@@ -705,7 +739,8 @@ export default async function plugin(bb: BbPluginApi) {
       return { ...result("already_exists", turns), generated: true };
     }
 
-    const execution = await resolveExecution(thread, signal);
+    const execution = await resolveExecution(thread, config.disposableWorkers, signal);
+    if (!execution) return result("disposable_workers_unsupported", turns);
     // Close the async setup window even if a realtime notification was missed.
     const beforeWorker = (await bb.sdk.threads.get({
       threadId,
@@ -1120,12 +1155,20 @@ export default async function plugin(bb: BbPluginApi) {
       );
       await rearmAfterManual(threadId, context.signal);
       if (!generation.recap) {
-        const message =
-          generation.reason === "thread_not_idle"
-            ? GENERATION_REASONS.thread_not_idle
-            : generation.reason === "hidden_thread"
-              ? "Recaps cannot be generated for hidden threads."
-              : `Could not generate a recap (${generation.reason ?? "unknown error"}).`;
+        let message: string;
+        switch (generation.reason) {
+          case "thread_not_idle":
+            message = GENERATION_REASONS.thread_not_idle;
+            break;
+          case "hidden_thread":
+            message = "Recaps cannot be generated for hidden threads.";
+            break;
+          case "disposable_workers_unsupported":
+            message = GENERATION_REASONS.disposable_workers_unsupported;
+            break;
+          default:
+            message = `Could not generate a recap (${generation.reason ?? "unknown error"}).`;
+        }
         return { exitCode: 1, stderr: message };
       }
       return {

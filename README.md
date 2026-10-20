@@ -115,10 +115,20 @@ bb plugin install path:$PWD --yes
 | **Thread header** | Open the Recap panel and generate a recap. |
 | **Command palette** | Choose **Recap: generate for this thread**. |
 | **Composer** | Read the latest recap inline; choose **On demand** to keep it out of the composer. |
-| **Plugin settings** | In **Recap behavior**, choose a model and configure automatic generation, cleanup, prompt, and display. |
+| **Plugin settings** | In **Recap behavior**, choose a model and configure automatic generation, cleanup, disposable workers, prompt, and display. |
 | **CLI** | Generate, show, or list recaps with `bb recap`. |
 
 Automatic generation and cleanup are on by default, and the inline display starts as a compact banner. The idle delay defaults to 30 seconds, the minimum is 3 user turns, and up to 2 recap workers may run at once. You can set the delay from 0–86,400 seconds, the minimum from 1–100 turns, and concurrency from 1–5 workers. The prompt accepts up to 8,000 characters; recap text is limited to 1,200 characters.
+
+### Disposable recap workers
+
+**Disposable recap workers** is off by default. When enabled, Recap requires the selected provider to support disposable sessions. BB and the execution host must implement the experimental provider-session lifetime API. The Codex provider maps this option to an ephemeral session.
+
+Recap saves each successful recap before archiving and stopping its worker. Saved recaps and BB worker history remain available. The worker's provider context cannot resume after release. This setting affects new Recap workers only and does not remove existing sessions or change user-task sessions.
+
+Worker cleanup attempts archive and stop at most twice each, retrying only an operation that has not succeeded. If either remains unconfirmed, Recap logs one warning with the worker ID and each operation's status for operator retry. Cleanup failure preserves a saved recap and does not generate a replacement worker.
+
+If the catalog lacks support, BB rejects creation as unsupported, or BB does not confirm the requested lifetime, Recap reports an error and skips automatic retries. Other startup and runtime failures keep the existing bounded retry behavior. Update BB and the execution host, select a supporting provider, or turn this setting off to use persistent workers again. Recap never silently falls back to a persistent worker when the setting is on.
 
 ## How it works
 
@@ -135,7 +145,7 @@ flowchart TD
 ```
 
 - **Bounded input.** Recap reads up to 120,000 transcript characters and limits generated text to 1,200 characters.
-- **Incremental refresh.** When a thread has new turns, Recap locates the saved user-row ID and sends the earlier summary plus the new turns. If that row is outside the bounded history window, or the recap predates cursor tracking, it combines the earlier summary with the available transcript. The worker is archived and stopped after each attempt.
+- **Incremental refresh.** When a thread has new turns, Recap locates the saved user-row ID and sends the earlier summary plus the new turns. If that row is outside the bounded history window, or the recap predates cursor tracking, it combines the earlier summary with the available transcript. Recap stores a successful result before archiving and stopping the worker after each attempt.
 - **Separate storage.** Recaps live in Recap's namespaced SQLite database. A new thread turn hides the earlier recap until a fresh one is generated.
 - **Automatic runs.** Recap listens for visible threads going idle, waits for the configured delay and turn minimum, and retries transient failures up to three times. Child threads that are still running keep the parent active.
 
@@ -187,7 +197,9 @@ skills/bb-recap/     Bundled agent skill for the CLI
 output/playwright/   Fictional-data showcase captures
 ```
 
-**Tests** cover transcript construction, prompt boundaries, settings and retry rules, concurrency, incremental recaps, and SQLite list/cleanup behaviour.
+**Tests** cover transcript construction, prompt boundaries, settings and retry rules, concurrency, incremental recaps, disposable-session negotiation, result retention before worker release, and SQLite list/cleanup behaviour.
+
+Disposable workers use `experimental_supportsDisposableSessions` from the existing provider catalog and request `experimental_providerSessionLifetime: "disposable"` at creation. Recap verifies that lifetime on the returned thread before accepting output. The published development SDK predates these fields, so the request uses a typed extension of the existing spawn arguments and Zod parses the new response fields. Default settings continue to work without this API.
 
 `PLUGIN_OVERVIEW.md` is the store listing. Keep it in step with `bb.description` in `package.json`.
 

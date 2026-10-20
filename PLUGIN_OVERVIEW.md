@@ -6,11 +6,13 @@ Recap creates short, display-only summaries of BB threads. It stores each recap 
 - Create automatic recaps after a visible thread goes idle and reaches the configured user-turn minimum. A thread with a child thread still running stays active. Recap does not scan idle threads at startup.
 - Refresh from the previous recap plus new turns when a thread has moved on. A new turn hides the previous recap until another is generated.
 - Show a compact composer banner, a banner that opens expanded, a recap card, or no inline recap until you open the Recap panel.
-- Configure the model, idle delay, turn minimum, concurrent workers, prompt, auto-cleanup, and display mode.
+- Configure the model, idle delay, turn minimum, concurrent workers, prompt, auto-cleanup, disposable workers, and display mode.
 
 ## Settings
 
 Automatic recaps and auto-cleanup are on by default. The idle delay defaults to 30 seconds (range 0–86,400), the minimum defaults to 3 user turns (range 1–100), and concurrency defaults to 2 workers (range 1–5). Prompts are capped at 8,000 characters. Generated recap text is capped at 1,200 characters. Cleanup removes suppressed attempts, older invalidated recaps, and visible records beyond the newest 1,000; it never deletes BB threads, messages, files, or projects.
+
+Disposable recap workers are off by default. Enabling this setting requires a supporting provider and BB execution host with the experimental provider-session lifetime API. The Codex provider uses an ephemeral session. Recap saves a successful recap before releasing the worker. Saved recaps and BB history remain available, but the released worker's provider context cannot resume. Existing sessions and user-task sessions are unchanged. Unsupported requests show an error without automatic retries or a silent persistent fallback. Update BB and its execution host, choose a supporting provider, or turn the setting off to use persistent workers.
 
 ## CLI
 

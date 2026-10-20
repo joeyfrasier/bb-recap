@@ -111,12 +111,17 @@ test("treats reverted settings edits as clean", () => {
   const saved = {
     auto: true,
     autoCleanup: true,
+    disposableWorkers: false,
     afterSeconds: 30,
     minTurns: 3,
     maxConcurrent: 2,
     prompt: "Write one sentence.",
   };
   assert.equal(recapFormIsDirty(saved, saved), false);
+  assert.equal(recapFormIsDirty({ ...saved, disposableWorkers: true }, saved), true);
+  assert.equal(normalizeRecapSettings({ disposableWorkers: true }).disposableWorkers, true);
+  assert.equal(normalizeRecapSettings({ disposableWorkers: "true" }).disposableWorkers, false);
+  assert.equal(normalizeRecapSettings({}).disposableWorkers, false);
   assert.equal(recapFormIsDirty({ ...saved, auto: false }, saved), true);
   assert.equal(recapFormIsDirty({ ...saved, auto: true }, saved), false);
   assert.equal(
@@ -147,12 +152,14 @@ test("form settings patches do not overwrite a newer display mode", () => {
     recapSettingsFormPatch({
       ...afterLayout,
       auto: false,
+      disposableWorkers: true,
       minTurns: 8,
       prompt: "Write one sentence.",
     }),
   );
   assert.equal(afterForm.displayMode, RECAP_DISPLAY_MODES.card);
   assert.equal(afterForm.auto, false);
+  assert.equal(afterForm.disposableWorkers, true);
   assert.equal(afterForm.minTurns, 8);
 });
 

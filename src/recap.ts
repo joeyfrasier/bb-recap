@@ -86,6 +86,7 @@ export function settingsFormStatusLabel(status: SettingsFormStatus): string {
 export type RecapFormSnapshot = {
   auto: boolean;
   autoCleanup: boolean;
+  disposableWorkers: boolean;
   afterSeconds: number;
   minTurns: number;
   maxConcurrent: number;
@@ -99,6 +100,7 @@ export function recapFormIsDirty(
   return (
     draft.auto !== saved.auto ||
     draft.autoCleanup !== saved.autoCleanup ||
+    draft.disposableWorkers !== saved.disposableWorkers ||
     draft.afterSeconds !== saved.afterSeconds ||
     draft.minTurns !== saved.minTurns ||
     draft.maxConcurrent !== saved.maxConcurrent ||
@@ -402,6 +404,7 @@ export function normalizeRecapSettings(value: unknown): RecapSettingsSnapshot {
     auto: typeof stored.auto === "boolean" ? stored.auto : true,
     autoCleanup:
       typeof stored.autoCleanup === "boolean" ? stored.autoCleanup : true,
+    disposableWorkers: stored.disposableWorkers === true,
     afterSeconds: parseBoundedInteger(
       typeof stored.afterSeconds === "number" ||
         typeof stored.afterSeconds === "string"
@@ -448,6 +451,7 @@ export function recapSettingsFormPatch(
   return {
     auto: next.auto,
     autoCleanup: next.autoCleanup,
+    disposableWorkers: next.disposableWorkers,
     afterSeconds: next.afterSeconds,
     minTurns: next.minTurns,
     maxConcurrent: next.maxConcurrent,
@@ -470,6 +474,8 @@ export const GENERATION_REASONS = {
   thread_not_idle:
     "Wait for the thread to become idle before generating a recap. Running child threads keep it active.",
   automatic_disabled: "Automatic recaps are disabled.",
+  disposable_workers_unsupported:
+    "This provider or BB host cannot create disposable workers. Update BB and the execution host, choose a provider that supports disposable sessions, or turn off Disposable recap workers in Recap settings.",
 } as const;
 
 export type GenerationReason = keyof typeof GENERATION_REASONS;
