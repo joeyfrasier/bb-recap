@@ -5,6 +5,8 @@ import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import plugin from "../src/server.ts";
 import type { Recap, RecapSettings } from "../src/server.ts";
 
+type WorkerWaitArgs = Parameters<BbPluginApi["sdk"]["threads"]["wait"]>[0];
+
 function deferred() {
   let resolve!: () => void;
   const promise = new Promise<void>((done) => { resolve = done; });
@@ -13,10 +15,15 @@ function deferred() {
 
 async function createHarness(options: {
   timeline?: (args: { threadId: string; beforeAnchorSeq?: string }) => Promise<unknown>;
-  wait?: (threadId: string) => Promise<void>;
+  get?: (threadId: string) => Promise<Record<string, unknown>>;
+  wait?: (threadId: string, args: WorkerWaitArgs) => Promise<void>;
   output?: (threadId: string) => Promise<string | null>;
   archive?: (threadId: string) => Promise<void>;
   stop?: (threadId: string) => Promise<void>;
+  queuedMessages?: (threadId: string) => Promise<Array<Record<string, unknown>>>;
+  cancelQueuedMessage?: (threadId: string, queuedMessageId: string) => Promise<void>;
+  updatePluginMetadata?: (args: { threadId: string; pluginId: string; set: Record<string, unknown> }) => Promise<void>;
+  metadataAvailable?: boolean;
   database?: Database.Database;
   listThreads?: (args: { parentThreadId?: string }) => Promise<unknown[]>;
   settings?: Partial<RecapSettings>;
@@ -53,17 +60,22 @@ async function createHarness(options: {
     sdk: {
       subscribe: () => () => {},
       threads: {
-        get: async ({ threadId }: { threadId: string }) => thread(threadId),
+        get: async ({ threadId }: { threadId: string }) => ({ ...thread(threadId), ...await options.get?.(threadId) }),
         list: async (args: { parentThreadId?: string }) => (options.listThreads ?? (async () => []))(args),
         timeline: options.timeline ?? (async ({ threadId }: { threadId: string }) => ({
           rows: [{ id: `${threadId}-user`, kind: "conversation", role: "user", threadId, text: "Work" }],
           timelinePage: { hasOlderRows: false, olderCursor: null },
         })),
         spawn: async (input: (typeof spawned)[number]) => { spawned.push(input); return options.spawnResponse ? await options.spawnResponse(spawned.length) : { id: String(spawned.length) }; },
-        wait: async ({ threadId }: { threadId: string }) => { await options.wait?.(threadId); return {}; },
+        wait: async (args: WorkerWaitArgs) => { await options.wait?.(args.threadId, args); return {}; },
         output: async ({ threadId }: { threadId: string }) => ({ output: options.output ? await options.output(threadId) : "We did work." }),
         archive: async ({ threadId }: { threadId: string }) => { await options.archive?.(threadId); },
         stop: async ({ threadId }: { threadId: string }) => { await options.stop?.(threadId); },
+        queuedMessages: {
+          list: async ({ threadId }: { threadId: string }) => options.queuedMessages?.(threadId) ?? [],
+          delete: async ({ threadId, queuedMessageId }: { threadId: string; queuedMessageId: string }) => { await options.cancelQueuedMessage?.(threadId, queuedMessageId); },
+        },
+        updatePluginMetadata: options.metadataAvailable === false ? undefined : async (args: { threadId: string; pluginId: string; set: Record<string, unknown> }) => { await options.updatePluginMetadata?.(args); },
       },
       providers: { models: async (query: unknown) => { modelQueries.push(query); return { models: [{ id: "m", model: "m", supportedReasoningEfforts: [{ reasoningEffort: "low" }], defaultReasoningEffort: "low" }], providers: [options.provider ?? { id: "p" }] }; } },
     },
@@ -127,9 +139,360 @@ test("enabled disposable workers retain recaps and preserve execution selection"
     assert.equal(worker.visibility, "hidden");
     assert.match(worker.prompt ?? "", /Return a recap\./);
     assert.equal(harness.modelQueries.length, 1);
-    assert.deepEqual(cleanup, ["archive:1", "stop:1"]);
+    assert.deepEqual(cleanup, ["stop:1", "archive:1"]);
     assert.deepEqual(harness.db.prepare("SELECT summary FROM recaps").get(), { summary: "We did work." });
   } finally { await harness.close(); }
+});
+
+test("a disposable worker queued beyond two minutes gets its execution budget after admission and saves before release", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
+  const db = new Database(":memory:");
+  let workerStatus: "pending" | "active" | "idle" = "pending";
+  const cleanup: string[] = [];
+  const idleWaiters = new Set<() => void>();
+  const observeRetention = (action: string) => async (id: string) => {
+    cleanup.push(`${action}:${id}`);
+    assert.deepEqual(db.prepare("SELECT summary FROM recaps").get(), { summary: "We did work." });
+  };
+  const harness = await createHarness({
+    database: db,
+    settings: { disposableWorkers: true },
+    provider: { id: "p", capabilities: { experimental_supportsDisposableSessions: true } },
+    spawnResponse: async () => ({ id: "worker", experimental_providerSessionLifetime: "disposable" }),
+    get: async (id) => id === "worker" ? { status: workerStatus } : {},
+    wait: async (_id, args) => {
+      assert.equal(args.timeoutMs, 120_000);
+      if (workerStatus === "idle") return;
+      await new Promise<void>((resolve, reject) => {
+        const finish = () => {
+          clearTimeout(timer);
+          idleWaiters.delete(finish);
+          resolve();
+        };
+        const timer = setTimeout(() => {
+          idleWaiters.delete(finish);
+          reject(new Error("Worker idle wait timed out"));
+        }, args.timeoutMs);
+        idleWaiters.add(finish);
+      });
+    },
+    archive: observeRetention("archive"),
+    stop: observeRetention("stop"),
+  });
+  try {
+    const pending = harness.handlers.recap_generate({ threadId: "source", automatic: false });
+    const settled = pending.then((value) => ({ value }), (error: unknown) => ({ error }));
+    await new Promise(setImmediate);
+    for (let elapsed = 0; elapsed < 120_000; elapsed += 1_000) {
+      t.mock.timers.tick(1_000);
+      await new Promise(setImmediate);
+    }
+    assert.deepEqual(cleanup, [], "Queued workers must survive the execution timeout before admission");
+    workerStatus = "active";
+    t.mock.timers.tick(1_000);
+    await new Promise(setImmediate);
+    t.mock.timers.tick(119_000);
+    await new Promise(setImmediate);
+    assert.deepEqual(cleanup, [], "The execution budget starts after admission");
+    workerStatus = "idle";
+    for (const finish of idleWaiters) finish();
+    await new Promise(setImmediate);
+    const outcome = await settled;
+    assert.ok("value" in outcome, "The admitted worker must complete successfully");
+    assert.equal(outcome.value.generated, true);
+    assert.equal(outcome.value.recap?.summary, "We did work.");
+    assert.equal((await harness.handlers.recap_get({ threadId: "source" })).recap?.summary, "We did work.");
+    assert.deepEqual(cleanup.slice().sort(), ["archive:worker", "stop:worker"]);
+  } finally {
+    workerStatus = "idle";
+    for (const finish of idleWaiters) finish();
+    await harness.close();
+  }
+});
+
+function queuedWorkerInput() {
+  return {
+    id: "queued-recap",
+    threadId: "worker",
+    originPluginId: "bb-recap",
+    content: [{ type: "text", text: "Retained private worker input" }],
+    state: "waiting",
+    waitingOn: { kind: "concurrency", hostId: "host" },
+    failureReason: null,
+  };
+}
+
+test("permanently queued workers have finite admission and preserve input before cancellation, stop and archive", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
+  let status = "pending";
+  let queue = [queuedWorkerInput()];
+  const operations: string[] = [];
+  let waits = 0;
+  const harness = await createHarness({
+    spawnResponse: async () => ({ id: "worker" }),
+    get: async (id) => id === "worker" ? { status } : {},
+    wait: async () => { waits += 1; },
+    queuedMessages: async () => queue,
+    updatePluginMetadata: async ({ threadId, pluginId, set }) => {
+      assert.equal(threadId, "worker");
+      assert.equal(pluginId, "bb-recap");
+      assert.deepEqual(set.recapWorkerCleanup, { capturedAt: Date.now(), queuedMessages: [queuedWorkerInput()] });
+      operations.push("retain");
+    },
+    cancelQueuedMessage: async (threadId, id) => {
+      assert.equal(threadId, "worker");
+      assert.equal(id, "queued-recap");
+      assert.deepEqual(operations, ["retain"]);
+      operations.push("cancel");
+      queue = [];
+    },
+    stop: async () => { operations.push("stop"); status = "idle"; },
+    archive: async () => { operations.push("archive"); },
+  });
+  try {
+    const pending = harness.handlers.recap_generate({ threadId: "source", automatic: false });
+    await new Promise(setImmediate);
+    for (let elapsed = 0; elapsed < 600_000; elapsed += 1_000) {
+      t.mock.timers.tick(1_000);
+      await new Promise(setImmediate);
+    }
+    const generation = await pending;
+    assert.equal(generation.reason, "worker_admission_timeout");
+    assert.equal(generation.generated, false);
+    assert.equal(waits, 0);
+    assert.deepEqual(operations, ["retain", "cancel", "stop", "archive"]);
+    assert.equal(harness.spawned.length, 1);
+  } finally { status = "idle"; await harness.close(); }
+});
+
+test("cancellation during admission promptly retires its queued worker without reading output", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
+  let status = "starting";
+  let queue = [queuedWorkerInput()];
+  const operations: string[] = [];
+  let outputReads = 0;
+  const harness = await createHarness({
+    spawnResponse: async () => ({ id: "worker" }),
+    get: async (id) => id === "worker" ? { status } : {},
+    queuedMessages: async () => queue,
+    updatePluginMetadata: async () => { operations.push("retain"); },
+    cancelQueuedMessage: async () => { operations.push("cancel"); queue = []; },
+    output: async () => { outputReads += 1; return "Not accepted"; },
+    stop: async () => { operations.push("stop"); status = "idle"; },
+    archive: async () => { operations.push("archive"); },
+  });
+  try {
+    const pending = harness.handlers.recap_generate({ threadId: "source", automatic: false });
+    await new Promise(setImmediate);
+    harness.activate("source");
+    const generation = await pending;
+    assert.equal(generation.reason, "aborted");
+    assert.equal(outputReads, 0);
+    assert.deepEqual(operations, ["retain", "cancel", "stop", "archive"]);
+  } finally { status = "idle"; await harness.close(); }
+});
+
+test("admitted workers retain the bounded two-minute execution timeout", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
+  let status = "active";
+  let outputReads = 0;
+  const cleanup: string[] = [];
+  const failure = new Error("Worker execution timed out");
+  const harness = await createHarness({
+    spawnResponse: async () => ({ id: "worker" }),
+    get: async (id) => id === "worker" ? { status } : {},
+    wait: async (_id, args) => {
+      assert.equal(args.timeoutMs, 120_000);
+      await new Promise<void>((_, reject) => setTimeout(() => reject(failure), args.timeoutMs));
+    },
+    output: async () => { outputReads += 1; return "Not accepted"; },
+    stop: async () => { cleanup.push("stop"); status = "idle"; },
+    archive: async () => { cleanup.push("archive"); },
+  });
+  try {
+    const pending = harness.handlers.recap_generate({ threadId: "source", automatic: false });
+    const rejected = assert.rejects(pending, (error) => error === failure);
+    await new Promise(setImmediate);
+    t.mock.timers.tick(119_999);
+    await new Promise(setImmediate);
+    assert.deepEqual(cleanup, []);
+    t.mock.timers.tick(1);
+    await rejected;
+    assert.equal(outputReads, 0);
+    assert.deepEqual(cleanup, ["stop", "archive"]);
+  } finally { status = "idle"; await harness.close(); }
+});
+
+test("a queue cancellation lost to admission accepts 404 and stops the admitted turn before archiving", async () => {
+  let queue = [queuedWorkerInput()];
+  let status = "idle";
+  const operations: string[] = [];
+  const failure = new Error("Original provider failure");
+  const harness = await createHarness({
+    spawnResponse: async () => ({ id: "worker" }),
+    get: async (id) => id === "worker" ? { status } : {},
+    wait: async () => { throw failure; },
+    queuedMessages: async () => queue,
+    updatePluginMetadata: async () => { operations.push("retain"); },
+    cancelQueuedMessage: async () => {
+      operations.push("cancel"); queue = []; status = "active";
+      throw Object.assign(new Error("already consumed"), { status: 404 });
+    },
+    stop: async () => { operations.push("stop"); status = "idle"; },
+    archive: async () => { operations.push("archive"); },
+  });
+  try {
+    await assert.rejects(harness.handlers.recap_generate({ threadId: "source", automatic: false }), (error) => error === failure);
+    assert.deepEqual(operations, ["retain", "cancel", "stop", "archive"]);
+    assert.deepEqual(harness.warnings, []);
+  } finally { await harness.close(); }
+});
+
+for (const failedStage of ["queue list", "metadata API", "retention", "cancel", "stop", "ownership"] as const) {
+  test(`unconfirmed ${failedStage} retains its worker and evidence without replacement`, async (t) => {
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
+    const failure = new Error("Original provider failure");
+    const input = { ...queuedWorkerInput(), ...(failedStage === "ownership" ? { originPluginId: "other-plugin" } : {}) };
+    let queue = [input];
+    const operations: string[] = [];
+    const harness = await createHarness({
+      settings: { afterSeconds: 0 },
+      metadataAvailable: failedStage !== "metadata API",
+      spawnResponse: async () => ({ id: "worker" }),
+      wait: async () => { throw failure; },
+      queuedMessages: async () => {
+        if (failedStage === "queue list") throw new Error("synthetic-secret-list-error");
+        return queue;
+      },
+      updatePluginMetadata: async ({ set }) => {
+        assert.deepEqual((set.recapWorkerCleanup as { queuedMessages: unknown[] }).queuedMessages, [input]);
+        operations.push("retain");
+        if (failedStage === "retention") throw new Error("synthetic-secret-retention-error");
+      },
+      cancelQueuedMessage: async () => {
+        operations.push("cancel");
+        if (failedStage === "cancel") throw new Error("synthetic-secret-cancel-error");
+        queue = [];
+      },
+      stop: async () => {
+        operations.push("stop");
+        if (failedStage === "stop") throw new Error("synthetic-secret-stop-error");
+      },
+      archive: async () => { operations.push("archive"); },
+    });
+    try {
+      await assert.rejects(harness.handlers.recap_generate({ threadId: "source", automatic: false }), (error) => error === failure);
+      assert.equal(operations.includes("archive"), false);
+      if (["retention", "metadata API"].includes(failedStage)) assert.equal(operations.includes("cancel"), false);
+      if (failedStage === "ownership") assert.deepEqual(operations, ["retain"]);
+      if (["queue list", "metadata API", "retention", "cancel", "ownership"].includes(failedStage)) assert.equal(queue.length, 1);
+      assert.equal(harness.warnings.length, 1);
+      assert.equal(harness.warnings[0].includes("synthetic-secret"), false);
+      harness.emit("thread.idle", { thread: { ...idleParent(), id: "source" } });
+      await new Promise(setImmediate);
+      t.mock.timers.tick(90_000);
+      await new Promise(setImmediate);
+      assert.equal(harness.spawned.length, 1, "The old worker must settle before any replacement");
+    } finally { await harness.close(); }
+  });
+}
+
+test("cleanup reconciliation preserves the original queue snapshot and permits a future generation only after settlement", async () => {
+  let queue = [queuedWorkerInput()];
+  let cancelFails = true;
+  const retained: unknown[] = [];
+  const operations: string[] = [];
+  const harness = await createHarness({
+    spawnResponse: async () => ({ id: "worker" }),
+    queuedMessages: async () => queue,
+    updatePluginMetadata: async ({ set }) => { retained.push(structuredClone(set.recapWorkerCleanup)); },
+    cancelQueuedMessage: async () => {
+      operations.push("cancel");
+      if (cancelFails) throw new Error("cancel failed");
+      queue = [];
+    },
+    stop: async () => { operations.push("stop"); },
+    archive: async () => { operations.push("archive"); },
+  });
+  try {
+    const first = await harness.handlers.recap_generate({ threadId: "source", automatic: false });
+    assert.equal(first.reason, "worker_cleanup_unconfirmed");
+    assert.equal(first.recap?.summary, "We did work.");
+    assert.equal(harness.spawned.length, 1);
+    const blocked = await harness.handlers.recap_generate({ threadId: "source", automatic: false });
+    assert.equal(blocked.reason, "worker_cleanup_unconfirmed");
+    assert.equal(harness.spawned.length, 1);
+    assert.equal(retained.length, 1, "The first preserved snapshot must not be overwritten by retries");
+    cancelFails = false;
+    const next = await harness.handlers.recap_generate({ threadId: "source", automatic: false });
+    assert.equal(next.generated, true);
+    assert.equal(harness.spawned.length, 2);
+    assert.equal(retained.length, 1);
+    assert.deepEqual(operations.slice(4, 7), ["cancel", "stop", "archive"]);
+  } finally { await harness.close(); }
+});
+
+test("an unresolved cleanup request is not duplicated and late completion is reconciled", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
+  const releaseStop = deferred();
+  let stopCalls = 0;
+  let archives = 0;
+  const harness = await createHarness({
+    stop: async () => { stopCalls += 1; await releaseStop.promise; },
+    archive: async () => { archives += 1; },
+  });
+  try {
+    const first = harness.handlers.recap_generate({ threadId: "source", automatic: false });
+    await new Promise(setImmediate);
+    t.mock.timers.tick(10_000);
+    await new Promise(setImmediate);
+    assert.equal((await first).reason, "worker_cleanup_unconfirmed");
+    assert.equal(stopCalls, 1);
+    const blocked = harness.handlers.recap_generate({ threadId: "source", automatic: false });
+    await new Promise(setImmediate);
+    t.mock.timers.tick(10_000);
+    await new Promise(setImmediate);
+    assert.equal((await blocked).reason, "worker_cleanup_unconfirmed");
+    assert.equal(stopCalls, 1);
+    assert.equal(archives, 0);
+    releaseStop.resolve();
+    await new Promise(setImmediate);
+    const next = await harness.handlers.recap_generate({ threadId: "source", automatic: false });
+    assert.equal(next.generated, true);
+    assert.equal(stopCalls, 2, "Only the new worker needs another stop");
+    assert.equal(archives, 2);
+  } finally { releaseStop.resolve(); await harness.close(); }
+});
+
+test("a stop acknowledgement without terminal settlement is retried on the same worker before replacement", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
+  let firstStatus = "active";
+  let firstStops = 0;
+  const archives: string[] = [];
+  const harness = await createHarness({
+    get: async (id) => id === "1" ? { status: firstStatus } : {},
+    stop: async (id) => {
+      if (id === "1") {
+        firstStops += 1;
+        if (firstStops === 2) firstStatus = "idle";
+      }
+    },
+    archive: async (id) => { archives.push(id); },
+  });
+  try {
+    const first = harness.handlers.recap_generate({ threadId: "source", automatic: false });
+    await new Promise(setImmediate);
+    t.mock.timers.tick(10_000);
+    await new Promise(setImmediate);
+    assert.equal((await first).reason, "worker_cleanup_unconfirmed");
+    assert.equal(firstStops, 1);
+    assert.deepEqual(archives, []);
+    const second = await harness.handlers.recap_generate({ threadId: "source", automatic: false });
+    assert.equal(second.generated, true);
+    assert.equal(firstStops, 2);
+    assert.deepEqual(archives, ["1", "2"]);
+    assert.equal(harness.spawned.length, 2);
+  } finally { firstStatus = "idle"; await harness.close(); }
 });
 
 for (const capability of ["absent", undefined, false, "true"]) {
@@ -176,7 +539,7 @@ for (const echo of [undefined, "persistent", true]) {
       const generated = await harness.handlers.recap_generate({ threadId: "source", automatic: false });
       assert.equal(generated.reason, "disposable_workers_unsupported");
       assert.equal(generated.generated, false);
-      assert.deepEqual(cleanup, ["archive:1", "stop:1"]);
+      assert.deepEqual(cleanup, ["stop:1", "archive:1"]);
       assert.equal(outputReads, 0);
       assert.deepEqual(harness.db.prepare("SELECT count(*) AS count FROM recaps").get(), { count: 0 });
     } finally { await harness.close(); }
@@ -202,7 +565,7 @@ test("an in-flight worker keeps its requested disposable lifetime when settings 
     const generated = await pending;
     assert.equal(generated.reason, "disposable_workers_unsupported");
     assert.equal(harness.spawned[0].experimental_providerSessionLifetime, "disposable");
-    assert.deepEqual(cleanup, ["archive:1", "stop:1"]);
+    assert.deepEqual(cleanup, ["stop:1", "archive:1"]);
   } finally { release.resolve(); await harness.close(); }
 });
 
@@ -254,8 +617,8 @@ test("retains the recap before archiving or stopping its worker", async () => {
     assert.equal(generated.generated, true);
     assert.equal(generated.recap?.summary, "We did work.");
     assert.deepEqual(cleanup, [
-      { action: "archive", threadId: "1", summary: "We did work." },
       { action: "stop", threadId: "1", summary: "We did work." },
+      { action: "archive", threadId: "1", summary: "We did work." },
     ]);
   } finally {
     await harness.close();
@@ -289,7 +652,7 @@ for (const stage of ["wait timeout", "output", "validation"] as const) {
         harness.handlers.recap_generate({ threadId: "source", automatic: false }),
         (error) => error === failure,
       );
-      assert.deepEqual(cleanup, ["archive:1", "stop:1"]);
+      assert.deepEqual(cleanup, ["stop:1", "archive:1"]);
       assert.deepEqual(await harness.handlers.recap_get({ threadId: "source" }), { recap: null, generating: false });
     } finally {
       await harness.close();
@@ -309,7 +672,7 @@ test("releases the worker when the recap cannot be saved", async () => {
       harness.handlers.recap_generate({ threadId: "source", automatic: false }),
       /recap save failed/,
     );
-    assert.deepEqual(cleanup, ["archive:1", "stop:1"]);
+    assert.deepEqual(cleanup, ["stop:1", "archive:1"]);
     assert.deepEqual(await harness.handlers.recap_get({ threadId: "source" }), { recap: null, generating: false });
   } finally {
     await harness.close();
@@ -331,7 +694,7 @@ for (const failedAction of ["archive", "stop"] as const) {
     try {
       const generated = await harness.handlers.recap_generate({ threadId: "source", automatic: false });
       assert.equal(generated.recap?.summary, "We did work.");
-      assert.deepEqual(cleanup, ["archive:1", "stop:1", `${failedAction}:1`]);
+      assert.deepEqual(cleanup, failedAction === "stop" ? ["stop:1", "stop:1", "archive:1"] : ["stop:1", "archive:1", "archive:1"]);
       assert.deepEqual(harness.warnings, []);
       assert.equal(harness.spawned.length, 1);
     } finally { await harness.close(); }
@@ -339,7 +702,7 @@ for (const failedAction of ["archive", "stop"] as const) {
 }
 
 for (const failedAction of ["archive", "stop", "both"] as const) {
-  test(`persistent ${failedAction} cleanup failure retains the recap and warns once with confirmed statuses`, async () => {
+  test(`persistent ${failedAction} cleanup failure retains the recap and warns once without archival after a failed stop`, async () => {
     const cleanup: string[] = [];
     const perform = (action: "archive" | "stop") => async (threadId: string) => {
       cleanup.push(`${action}:${threadId}`);
@@ -354,14 +717,12 @@ for (const failedAction of ["archive", "stop", "both"] as const) {
       const generated = await harness.handlers.recap_generate({ threadId: "source", automatic: false });
       assert.equal(generated.generated, true);
       assert.equal(generated.recap?.summary, "We did work.");
-      assert.deepEqual(cleanup, [
-        "archive:thr_cleanup_worker",
-        "stop:thr_cleanup_worker",
-        ...(failedAction !== "stop" ? ["archive:thr_cleanup_worker"] : []),
-        ...(failedAction !== "archive" ? ["stop:thr_cleanup_worker"] : []),
-      ]);
+      assert.equal(generated.reason, "worker_cleanup_unconfirmed");
+      assert.deepEqual(cleanup, failedAction === "archive"
+        ? ["stop:thr_cleanup_worker", "archive:thr_cleanup_worker", "archive:thr_cleanup_worker"]
+        : ["stop:thr_cleanup_worker", "stop:thr_cleanup_worker"]);
       assert.deepEqual(harness.warnings, [
-        `Recap worker cleanup incomplete for thr_cleanup_worker. Archive ${failedAction === "stop" ? "confirmed" : "unconfirmed"}; stop ${failedAction === "archive" ? "confirmed" : "unconfirmed"}. Any saved recap remains available.`,
+        "Recap worker cleanup unconfirmed for thr_cleanup_worker. Replacement blocked until this worker settles; any saved recap remains available.",
       ]);
       assert.equal((await harness.handlers.recap_get({ threadId: "source" })).recap?.id, generated.recap.id);
       assert.deepEqual(harness.db.prepare("SELECT summary FROM recaps").get(), { summary: "We did work." });
@@ -379,8 +740,8 @@ test("cleanup failures do not mask the original generation failure", async () =>
   });
   try {
     await assert.rejects(harness.handlers.recap_generate({ threadId: "source", automatic: false }), (error) => error === failure);
-    assert.deepEqual(cleanup, ["archive:1", "stop:1", "archive:1", "stop:1"]);
-    assert.deepEqual(harness.warnings, ["Recap worker cleanup incomplete for 1. Archive unconfirmed; stop unconfirmed. Any saved recap remains available."]);
+    assert.deepEqual(cleanup, ["stop:1", "stop:1"]);
+    assert.deepEqual(harness.warnings, ["Recap worker cleanup unconfirmed for 1. Replacement blocked until this worker settles; any saved recap remains available."]);
     assert.deepEqual(await harness.handlers.recap_get({ threadId: "source" }), { recap: null, generating: false });
     assert.deepEqual(harness.db.prepare("SELECT count(*) AS count FROM recaps").get(), { count: 0 });
   } finally { await harness.close(); }
@@ -401,14 +762,14 @@ test("automatic generation does not regenerate a saved recap after cleanup alone
     await new Promise(setImmediate);
     t.mock.timers.tick(0);
     await new Promise(setImmediate);
-    assert.deepEqual(cleanup, ["archive:1", "stop:1", "archive:1", "stop:1"]);
+    assert.deepEqual(cleanup, ["stop:1", "stop:1"]);
     assert.equal((await harness.handlers.recap_get({ threadId: "parent" })).recap?.summary, "We did work.");
     t.mock.timers.tick(90_000);
     await new Promise(setImmediate);
     const duplicate = await harness.handlers.recap_generate({ threadId: "parent", automatic: true });
-    assert.equal(duplicate.reason, "already_exists");
+    assert.equal(duplicate.reason, "worker_cleanup_unconfirmed");
     assert.equal(harness.spawned.length, 1);
-    assert.equal(harness.warnings.length, 1);
+    assert.equal(harness.warnings.length, 2);
     assert.deepEqual(harness.db.prepare("SELECT count(*) AS count FROM recaps").get(), { count: 1 });
   } finally { await harness.close(); }
 });
@@ -430,7 +791,7 @@ test("an aborted generation releases its worker without saving the output", asyn
     const generated = await pending;
     assert.equal(generated.generated, false);
     assert.equal(generated.reason, "aborted");
-    assert.deepEqual(cleanup, ["archive:1", "stop:1"]);
+    assert.deepEqual(cleanup, ["stop:1", "archive:1"]);
     assert.equal((await harness.handlers.recap_get({ threadId: "source" })).recap, null);
   } finally {
     release.resolve();
@@ -454,7 +815,7 @@ test("stale worker output is released without saving a recap", async () => {
     const generated = await harness.handlers.recap_generate({ threadId: "source", automatic: false });
     assert.equal(generated.generated, false);
     assert.equal(generated.reason, "stale");
-    assert.deepEqual(cleanup, ["archive:1", "stop:1"]);
+    assert.deepEqual(cleanup, ["stop:1", "archive:1"]);
     assert.equal((await harness.handlers.recap_get({ threadId: "source" })).recap, null);
   } finally {
     await harness.close();
@@ -472,7 +833,7 @@ test("empty worker output is released without reporting success", async () => {
     const generated = await harness.handlers.recap_generate({ threadId: "source", automatic: false });
     assert.equal(generated.generated, false);
     assert.equal(generated.reason, "empty_model_response");
-    assert.deepEqual(cleanup, ["archive:1", "stop:1"]);
+    assert.deepEqual(cleanup, ["stop:1", "archive:1"]);
     assert.equal((await harness.handlers.recap_get({ threadId: "source" })).recap, null);
   } finally {
     await harness.close();
@@ -497,14 +858,14 @@ test("an automatic retry uses a fresh disposable worker and retains the recap on
     t.mock.timers.tick(0);
     await new Promise(setImmediate);
     assert.equal(harness.spawned.length, 1);
-    assert.deepEqual(cleanup, ["archive:1", "stop:1"]);
+    assert.deepEqual(cleanup, ["stop:1", "archive:1"]);
     assert.equal((await harness.handlers.recap_get({ threadId: "parent" })).recap, null);
 
     t.mock.timers.tick(90_000);
     await new Promise(setImmediate);
     assert.equal(harness.spawned.length, 2);
     assert.deepEqual(harness.spawned.map((worker) => worker.experimental_providerSessionLifetime), ["disposable", "disposable"]);
-    assert.deepEqual(cleanup, ["archive:1", "stop:1", "archive:2", "stop:2"]);
+    assert.deepEqual(cleanup, ["stop:1", "archive:1", "stop:2", "archive:2"]);
     const retained = (await harness.handlers.recap_get({ threadId: "parent" })).recap;
     assert.equal(retained?.summary, "We did work.");
     const duplicate = await harness.handlers.recap_generate({ threadId: "parent", automatic: true });

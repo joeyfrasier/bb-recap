@@ -164,6 +164,9 @@ test("form settings patches do not overwrite a newer display mode", () => {
 });
 
 test("retries automatic recaps only for transient failures", () => {
+  assert.equal(shouldRetryAutomaticRecap({ generated: false, reason: "worker_admission_timeout", retryCount: 0 }), true);
+  assert.equal(shouldRetryAutomaticRecap({ generated: false, reason: "worker_admission_timeout", retryCount: MAX_AUTOMATIC_RECAP_RETRIES }), false);
+  assert.equal(shouldRetryAutomaticRecap({ generated: false, reason: "worker_cleanup_unconfirmed", retryCount: 0 }), false);
   assert.equal(
     shouldRetryAutomaticRecap({ generated: true, reason: null, retryCount: 0 }),
     false,

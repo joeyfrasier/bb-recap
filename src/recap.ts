@@ -476,6 +476,10 @@ export const GENERATION_REASONS = {
   automatic_disabled: "Automatic recaps are disabled.",
   disposable_workers_unsupported:
     "This provider or BB host cannot create disposable workers. Update BB and the execution host, choose a provider that supports disposable sessions, or turn off Disposable recap workers in Recap settings.",
+  worker_admission_timeout:
+    "The recap worker could not start within 10 minutes. Its queued input was retained before cancellation. Automatic generation may retry after cleanup is confirmed.",
+  worker_cleanup_unconfirmed:
+    "Recap worker cleanup could not be confirmed. The worker and any saved recap were retained; inspect the worker before retrying generation.",
 } as const;
 
 export type GenerationReason = keyof typeof GENERATION_REASONS;
@@ -494,6 +498,7 @@ export function shouldRetryAutomaticRecap(options: {
 }): boolean {
   if (options.generated) return false;
   if (options.retryCount >= MAX_AUTOMATIC_RECAP_RETRIES) return false;
+  if (options.reason === "worker_admission_timeout") return true;
   if (
     options.reason !== null &&
     Object.hasOwn(GENERATION_REASONS, options.reason)

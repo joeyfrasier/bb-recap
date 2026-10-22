@@ -124,11 +124,13 @@ Automatic generation and cleanup are on by default, and the inline display start
 
 **Disposable recap workers** is off by default. When enabled, Recap requires the selected provider to support disposable sessions. BB and the execution host must implement the experimental provider-session lifetime API. The Codex provider maps this option to an ephemeral session.
 
-Recap saves each successful recap before archiving and stopping its worker. Saved recaps and BB worker history remain available. The worker's provider context cannot resume after release. This setting affects new Recap workers only and does not remove existing sessions or change user-task sessions.
+Recap allows up to 10 minutes for a new worker to leave BB's pending/starting state. Its two-minute execution budget begins after admission, so waiting behind a host concurrency limit does not consume that budget. A worker that has already completed can return immediately.
 
-Worker cleanup attempts archive and stop at most twice each, retrying only an operation that has not succeeded. If either remains unconfirmed, Recap logs one warning with the worker ID and each operation's status for operator retry. Cleanup failure preserves a saved recap and does not generate a replacement worker.
+Recap saves each successful recap before releasing its worker. If queued input remains, Recap first retains the complete public queue records, including the prompt and failure context, in the worker's private BB plugin metadata. Only entries attributed to Recap on that new worker may then be cancelled through BB's queued-message API. Unexpected writers or failed retention leave the queue intact. BB limits each plugin's thread metadata to 256 KiB; a snapshot rejected by that limit leaves the worker and queue retained for inspection. Recap stops the worker, confirms it is idle or failed with an empty queue, and then archives it. Saved recaps and BB worker history remain available; disposable provider context cannot resume after release. This setting affects new Recap workers only and does not remove existing sessions or change user-task sessions.
 
-If the catalog lacks support, BB rejects creation as unsupported, or BB does not confirm the requested lifetime, Recap reports an error and skips automatic retries. Other startup and runtime failures keep the existing bounded retry behavior. Update BB and the execution host, select a supporting provider, or turn this setting off to use persistent workers again. Recap never silently falls back to a persistent worker when the setting is on.
+Cleanup retries a returned failure at most once per operation. An unresolved request timeout is retained for later reconciliation rather than duplicated. If cleanup cannot be confirmed, Recap logs a fixed warning with the worker ID and blocks replacement. Any saved recap remains usable. Within the plugin's current lifetime, a later generation first reconciles that same worker and preserves the original queue snapshot; a replacement can start only after settlement. This uncertainty tracking is in memory. Reloading the plugin does not recover or clean up historical unsettled workers automatically; operators must preserve and inspect those records separately.
+
+If the catalog lacks support, BB rejects creation as unsupported, or BB does not confirm the requested lifetime, Recap reports an error and skips automatic retries. A settled admission timeout and other transient startup/runtime failures retain the existing limit of three automatic retries with a 90-second delay. Unconfirmed cleanup never schedules a replacement. Update BB and the execution host, select a supporting provider, or turn this setting off to use persistent workers again. Recap never silently falls back to a persistent worker when the setting is on.
 
 ## How it works
 
@@ -145,7 +147,7 @@ flowchart TD
 ```
 
 - **Bounded input.** Recap reads up to 120,000 transcript characters and limits generated text to 1,200 characters.
-- **Incremental refresh.** When a thread has new turns, Recap locates the saved user-row ID and sends the earlier summary plus the new turns. If that row is outside the bounded history window, or the recap predates cursor tracking, it combines the earlier summary with the available transcript. Recap stores a successful result before archiving and stopping the worker after each attempt.
+- **Incremental refresh.** When a thread has new turns, Recap locates the saved user-row ID and sends the earlier summary plus the new turns. If that row is outside the bounded history window, or the recap predates cursor tracking, it combines the earlier summary with the available transcript. Recap stores a successful result before settling and archiving the worker after each attempt.
 - **Separate storage.** Recaps live in Recap's namespaced SQLite database. A new thread turn hides the earlier recap until a fresh one is generated.
 - **Automatic runs.** Recap listens for visible threads going idle, waits for the configured delay and turn minimum, and retries transient failures up to three times. Child threads that are still running keep the parent active.
 
@@ -153,8 +155,8 @@ flowchart TD
 
 - 🛡️ **Separate from the conversation.** Recaps are stored outside the original thread transcript and are not added to its model context.
 - 🌐 **Provider handling applies.** The bounded transcript goes to the provider selected in Recap or BB's default provider. That provider may process it remotely under its own policy; Recap has no separate account or API key.
-- ⚠️ **A hidden worker is still a worker.** BB currently offers `accept-edits` as the least-permissive mode for spawned threads; it is not read-only. Recap instructs the worker to return a recap only, then archives and stops it. The worker remains subject to BB's tools and permission model, so install only plugins you trust.
-- 🧹 **Cleanup stays in Recap's database.** When enabled, cleanup removes suppressed attempts, older invalidated recaps, and visible records beyond the newest 1,000. It never deletes BB threads, messages, files, or projects.
+- ⚠️ **A hidden worker is still a worker.** BB currently offers `accept-edits` as the least-permissive mode for spawned threads; it is not read-only. Recap instructs the worker to return a recap only, then stops and archives it after confirming settlement. The worker remains subject to BB's tools and permission model, so install only plugins you trust.
+- 🧹 **Recap pruning stays in Recap's database.** When enabled, saved-recap pruning removes suppressed attempts, older invalidated recaps, and visible records beyond the newest 1,000. That option never deletes BB threads, messages, files, or projects. Worker retirement separately preserves queued input in BB plugin metadata before cancelling only Recap-owned queue entries, as described above.
 
 ## CLI
 
@@ -197,9 +199,9 @@ skills/bb-recap/     Bundled agent skill for the CLI
 output/playwright/   Fictional-data showcase captures
 ```
 
-**Tests** cover transcript construction, prompt boundaries, settings and retry rules, concurrency, incremental recaps, disposable-session negotiation, result retention before worker release, and SQLite list/cleanup behaviour.
+**Tests** cover transcript construction, prompt boundaries, settings and retry rules, concurrency, admission and execution deadlines, queue retention before cancellation, cancellation/admission races, uncertain cleanup and reconciliation, incremental recaps, disposable-session negotiation, result retention before worker release, and SQLite list/cleanup behaviour.
 
-Disposable workers use `experimental_supportsDisposableSessions` from the existing provider catalog and request `experimental_providerSessionLifetime: "disposable"` at creation. Recap verifies that lifetime on the returned thread before accepting output. The published development SDK predates these fields, so the request uses a typed extension of the existing spawn arguments and Zod parses the new response fields. Default settings continue to work without this API.
+Disposable workers use `experimental_supportsDisposableSessions` from the existing provider catalog and request `experimental_providerSessionLifetime: "disposable"` at creation. Recap verifies that lifetime on the returned thread before accepting output. The published development SDK predates these fields, so the request uses a typed extension of the existing spawn arguments and Zod parses the new response fields. Queued-worker cancellation also requires the deployed `threads.updatePluginMetadata` API; Recap validates that callable at runtime and retains the worker if unavailable. Default persistent workers continue to use the original provider/session selection.
 
 `PLUGIN_OVERVIEW.md` is the store listing. Keep it in step with `bb.description` in `package.json`.
 
