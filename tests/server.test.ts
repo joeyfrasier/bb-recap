@@ -5,6 +5,8 @@ import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import plugin from "../src/server.ts";
 import type { Recap, RecapSettings } from "../src/server.ts";
 
+type WorkerWaitArgs = Parameters<BbPluginApi["sdk"]["threads"]["wait"]>[0];
+
 function deferred() {
   let resolve!: () => void;
   const promise = new Promise<void>((done) => { resolve = done; });
@@ -13,7 +15,8 @@ function deferred() {
 
 async function createHarness(options: {
   timeline?: (args: { threadId: string; beforeAnchorSeq?: string }) => Promise<unknown>;
-  wait?: (threadId: string) => Promise<void>;
+  get?: (threadId: string) => Promise<Record<string, unknown>>;
+  wait?: (threadId: string, args: WorkerWaitArgs) => Promise<void>;
   output?: (threadId: string) => Promise<string | null>;
   archive?: (threadId: string) => Promise<void>;
   stop?: (threadId: string) => Promise<void>;
@@ -53,14 +56,14 @@ async function createHarness(options: {
     sdk: {
       subscribe: () => () => {},
       threads: {
-        get: async ({ threadId }: { threadId: string }) => thread(threadId),
+        get: async ({ threadId }: { threadId: string }) => ({ ...thread(threadId), ...await options.get?.(threadId) }),
         list: async (args: { parentThreadId?: string }) => (options.listThreads ?? (async () => []))(args),
         timeline: options.timeline ?? (async ({ threadId }: { threadId: string }) => ({
           rows: [{ id: `${threadId}-user`, kind: "conversation", role: "user", threadId, text: "Work" }],
           timelinePage: { hasOlderRows: false, olderCursor: null },
         })),
         spawn: async (input: (typeof spawned)[number]) => { spawned.push(input); return options.spawnResponse ? await options.spawnResponse(spawned.length) : { id: String(spawned.length) }; },
-        wait: async ({ threadId }: { threadId: string }) => { await options.wait?.(threadId); return {}; },
+        wait: async (args: WorkerWaitArgs) => { await options.wait?.(args.threadId, args); return {}; },
         output: async ({ threadId }: { threadId: string }) => ({ output: options.output ? await options.output(threadId) : "We did work." }),
         archive: async ({ threadId }: { threadId: string }) => { await options.archive?.(threadId); },
         stop: async ({ threadId }: { threadId: string }) => { await options.stop?.(threadId); },
@@ -130,6 +133,71 @@ test("enabled disposable workers retain recaps and preserve execution selection"
     assert.deepEqual(cleanup, ["archive:1", "stop:1"]);
     assert.deepEqual(harness.db.prepare("SELECT summary FROM recaps").get(), { summary: "We did work." });
   } finally { await harness.close(); }
+});
+
+test("a disposable worker queued beyond two minutes gets its execution budget after admission and saves before release", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
+  const db = new Database(":memory:");
+  let workerStatus: "pending" | "active" | "idle" = "pending";
+  const cleanup: string[] = [];
+  const idleWaiters = new Set<() => void>();
+  const observeRetention = (action: string) => async (id: string) => {
+    cleanup.push(`${action}:${id}`);
+    assert.deepEqual(db.prepare("SELECT summary FROM recaps").get(), { summary: "We did work." });
+  };
+  const harness = await createHarness({
+    database: db,
+    settings: { disposableWorkers: true },
+    provider: { id: "p", capabilities: { experimental_supportsDisposableSessions: true } },
+    spawnResponse: async () => ({ id: "worker", experimental_providerSessionLifetime: "disposable" }),
+    get: async (id) => id === "worker" ? { status: workerStatus } : {},
+    wait: async (_id, args) => {
+      if (workerStatus === "idle") return;
+      await new Promise<void>((resolve, reject) => {
+        const finish = () => {
+          clearTimeout(timer);
+          idleWaiters.delete(finish);
+          resolve();
+        };
+        const timer = setTimeout(() => {
+          idleWaiters.delete(finish);
+          reject(new Error("Worker idle wait timed out"));
+        }, args.timeoutMs);
+        idleWaiters.add(finish);
+      });
+    },
+    archive: observeRetention("archive"),
+    stop: observeRetention("stop"),
+  });
+  try {
+    const pending = harness.handlers.recap_generate({ threadId: "source", automatic: false });
+    const settled = pending.then((value) => ({ value }), (error: unknown) => ({ error }));
+    await new Promise(setImmediate);
+    for (let elapsed = 0; elapsed < 120_000; elapsed += 1_000) {
+      t.mock.timers.tick(1_000);
+      await new Promise(setImmediate);
+    }
+    assert.deepEqual(cleanup, [], "Queued workers must survive the execution timeout before admission");
+    workerStatus = "active";
+    t.mock.timers.tick(1_000);
+    await new Promise(setImmediate);
+    t.mock.timers.tick(119_000);
+    await new Promise(setImmediate);
+    assert.deepEqual(cleanup, [], "The execution budget starts after admission");
+    workerStatus = "idle";
+    for (const finish of idleWaiters) finish();
+    await new Promise(setImmediate);
+    const outcome = await settled;
+    assert.ok("value" in outcome, "The admitted worker must complete successfully");
+    assert.equal(outcome.value.generated, true);
+    assert.equal(outcome.value.recap?.summary, "We did work.");
+    assert.equal((await harness.handlers.recap_get({ threadId: "source" })).recap?.summary, "We did work.");
+    assert.deepEqual(cleanup.slice().sort(), ["archive:worker", "stop:worker"]);
+  } finally {
+    workerStatus = "idle";
+    for (const finish of idleWaiters) finish();
+    await harness.close();
+  }
 });
 
 for (const capability of ["absent", undefined, false, "true"]) {
