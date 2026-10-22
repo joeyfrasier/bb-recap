@@ -43,6 +43,9 @@ const MAX_ID_CHARS = 256;
 const MAX_STORED_RECAPS = 1_000;
 const RETRY_AFTER_MS = 90_000;
 const WORKER_TIMEOUT_MS = 120_000;
+const WORKER_ADMISSION_TIMEOUT_MS = 600_000;
+const WORKER_POLL_MS = 1_000;
+const WORKER_CLEANUP_TIMEOUT_MS = 10_000;
 const RECAP_CHANGED = "recap-changed";
 const MODEL_SELECTION_KEY = "model-selection";
 const SETTINGS_KEY = "settings";
@@ -184,6 +187,16 @@ type ThreadState = {
   generationController?: AbortController;
   generationPromise?: Promise<GenerationResult>;
   retired?: boolean;
+  unsettledWorker?: WorkerCleanupState;
+};
+
+type WorkerCleanupState = {
+  threadId: string;
+  retainedQueue?: { capturedAt: number; queuedMessages: Array<z.infer<typeof retainedQueueMessageSchema>> };
+  snapshotPersisted?: boolean;
+  stopped?: boolean;
+  archived?: boolean;
+  pendingRequest?: Promise<unknown>;
 };
 
 type GenerationResult = {
@@ -257,6 +270,59 @@ const disposableWorkerSchema = z.object({
 const disposableUnsupportedErrorSchema = z.object({
   code: z.literal("disposable_sessions_unsupported"),
 });
+const notFoundErrorSchema = z.object({ status: z.literal(404) });
+const retainedQueueMessageSchema = z.object({ id: z.string() }).catchall(z.json());
+// The deployed SDK exposes this method; the published development SDK predates it.
+// Validate the callable and JSON input instead of assuming older hosts support it.
+const workerMetadataApiSchema = z.object({
+  updatePluginMetadata: z.function({
+    input: [z.object({
+      threadId: z.string(),
+      pluginId: z.string(),
+      set: z.record(z.string(), z.json()),
+    })],
+    output: z.promise(z.unknown()),
+  }),
+});
+
+class WorkerAdmissionTimeout extends Error {
+  constructor() { super("Recap worker admission timed out."); }
+}
+
+class WorkerCleanupRequestTimeout extends Error {
+  readonly pending: Promise<unknown>;
+  constructor(pending: Promise<unknown>) {
+    super("Recap worker cleanup request timed out.");
+    this.pending = pending;
+  }
+}
+
+function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const aborted = () => { clearTimeout(timer); reject(signal.reason); };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", aborted);
+      resolve();
+    }, milliseconds);
+    signal.addEventListener("abort", aborted, { once: true });
+    if (signal.aborted) aborted();
+  });
+}
+
+async function boundedWorkerRequest<T>(request: () => Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const pending = request();
+    return await Promise.race([
+      pending,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new WorkerCleanupRequestTimeout(pending)), WORKER_CLEANUP_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
 
 function normalizeModelSelection(
   selection: ModelSelection,
@@ -621,25 +687,114 @@ export default async function plugin(bb: BbPluginApi) {
     };
   };
 
-  const disposeWorker = async (threadId: string) => {
-    let archived = false;
-    let stopped = false;
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      if (!archived) {
-        try {
-          await bb.sdk.threads.archive({ threadId });
-          archived = true;
-        } catch {}
+  const waitForWorkerAdmission = async (threadId: string, signal?: AbortSignal) => {
+    const deadline = new AbortController();
+    const timer = setTimeout(() => deadline.abort(new WorkerAdmissionTimeout()), WORKER_ADMISSION_TIMEOUT_MS);
+    const admissionSignal = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal;
+    try {
+      while (true) {
+        admissionSignal.throwIfAborted();
+        const worker = await bb.sdk.threads.get({ threadId, signal: admissionSignal });
+        admissionSignal.throwIfAborted();
+        if (worker.status !== "starting" && String(worker.status) !== "pending") return;
+        await abortableDelay(WORKER_POLL_MS, admissionSignal);
       }
-      if (!stopped) {
-        try {
-          await bb.sdk.threads.stop({ threadId });
-          stopped = true;
-        } catch {}
-      }
-      if (archived && stopped) return;
+    } finally {
+      clearTimeout(timer);
     }
-    logWarning(`Recap worker cleanup incomplete for ${threadId}. Archive ${archived ? "confirmed" : "unconfirmed"}; stop ${stopped ? "confirmed" : "unconfirmed"}. Any saved recap remains available.`);
+  };
+
+  const disposeWorker = async (workerCleanup: WorkerCleanupState): Promise<boolean> => {
+    const { threadId } = workerCleanup;
+    const retry = async (operation: () => Promise<unknown>) => {
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try { await boundedWorkerRequest(operation); return true; }
+        catch (error) {
+          if (error instanceof WorkerCleanupRequestTimeout) {
+            workerCleanup.pendingRequest = error.pending;
+            return false;
+          }
+        }
+      }
+      return false;
+    };
+    const incomplete = () => {
+      logWarning(`Recap worker cleanup unconfirmed for ${threadId}. Replacement blocked until this worker settles; any saved recap remains available.`);
+      return false;
+    };
+    const pendingRequest = workerCleanup.pendingRequest;
+    if (pendingRequest) {
+      try {
+        await boundedWorkerRequest(() => pendingRequest.then(() => {}, () => {}));
+        workerCleanup.pendingRequest = undefined;
+      } catch { return incomplete(); }
+    }
+
+    let queued: Awaited<ReturnType<BbPluginApi["sdk"]["threads"]["queuedMessages"]["list"]>>;
+    try { queued = await boundedWorkerRequest(() => bb.sdk.threads.queuedMessages.list({ threadId })); }
+    catch { return incomplete(); }
+    if (queued.length > 0) {
+      const metadataApi = workerMetadataApiSchema.safeParse(bb.sdk.threads);
+      const snapshot = z.array(retainedQueueMessageSchema).safeParse(queued);
+      if (!metadataApi.success || !snapshot.success) return incomplete();
+      if (!workerCleanup.retainedQueue) {
+        workerCleanup.retainedQueue = { queuedMessages: snapshot.data, capturedAt: Date.now() };
+        workerCleanup.snapshotPersisted = false;
+      } else {
+        const retainedIds = new Set(workerCleanup.retainedQueue.queuedMessages.map((message) => message.id));
+        const additional = snapshot.data.filter((message) => !retainedIds.has(message.id));
+        if (additional.length > 0) {
+          workerCleanup.retainedQueue.queuedMessages.push(...additional);
+          workerCleanup.snapshotPersisted = false;
+        }
+      }
+      const retainedQueue = workerCleanup.retainedQueue;
+      if (!workerCleanup.snapshotPersisted && !await retry(async () => {
+        await metadataApi.data.updatePluginMetadata({
+          threadId,
+          pluginId: bb.pluginId,
+          set: { recapWorkerCleanup: retainedQueue },
+        });
+        workerCleanup.snapshotPersisted = true;
+      })) return incomplete();
+      const ownedQueueEntry = z.object({ threadId: z.literal(threadId), originPluginId: z.literal(bb.pluginId) });
+      if (!queued.every((message) => ownedQueueEntry.safeParse(message).success)) return incomplete();
+      for (const message of queued) {
+        if (!await retry(async () => {
+          try { await bb.sdk.threads.queuedMessages.delete({ threadId, queuedMessageId: message.id }); }
+          catch (error) { if (!notFoundErrorSchema.safeParse(error).success) throw error; }
+        })) return incomplete();
+      }
+    }
+    // A queue claim may have won the cancellation race. Stop its admitted turn,
+    // then confirm a terminal state and no outstanding queue before archiving.
+    if (!workerCleanup.stopped && !await retry(async () => {
+      await bb.sdk.threads.stop({ threadId });
+      workerCleanup.stopped = true;
+    })) return incomplete();
+    const settled = await retry(async () => {
+      const deadline = Date.now() + WORKER_CLEANUP_TIMEOUT_MS;
+      while (true) {
+        const worker = await bb.sdk.threads.get({ threadId });
+        if (worker.status === "idle" || worker.status === "error") break;
+        if (Date.now() >= deadline) throw new Error("Recap worker stop not confirmed.");
+        await new Promise((resolve) => setTimeout(resolve, WORKER_POLL_MS));
+      }
+      if ((await bb.sdk.threads.queuedMessages.list({ threadId })).length > 0)
+        throw new Error("Recap worker queue cancellation not confirmed.");
+    });
+    if (!settled) {
+      // A successful stop RPC can acknowledge deferred/prestart cancellation.
+      // It is confirmed only by the terminal-state check, so reconcile with a
+      // fresh stop if that check did not settle the worker.
+      workerCleanup.stopped = false;
+      return incomplete();
+    }
+    if (!workerCleanup.archived && !await retry(async () => {
+      await bb.sdk.threads.archive({ threadId });
+      workerCleanup.archived = true;
+    })) return incomplete();
+    return true;
   };
 
   const runWorker = async (
@@ -682,26 +837,35 @@ export default async function plugin(bb: BbPluginApi) {
       throw error;
     }
 
+    let generation: GenerationResult;
+    let cleanupConfirmed = false;
+    const workerCleanup: WorkerCleanupState = { threadId: worker.id };
     try {
-      if (signal?.aborted) return await consume("");
-      if (
+      if (signal?.aborted) generation = await consume("");
+      else if (
         execution.experimental_providerSessionLifetime &&
         !disposableWorkerSchema.safeParse(worker).success
-      ) return result("disposable_workers_unsupported");
-      await bb.sdk.threads.wait({
-        threadId: worker.id,
-        status: "idle",
-        timeoutMs: WORKER_TIMEOUT_MS,
-        signal,
-      });
-      if (signal?.aborted) return await consume("");
-      return await consume(
-        (await bb.sdk.threads.output({ threadId: worker.id, signal })).output ??
-        "",
-      );
+      ) generation = result("disposable_workers_unsupported");
+      else {
+        await waitForWorkerAdmission(worker.id, signal);
+        await bb.sdk.threads.wait({
+          threadId: worker.id,
+          status: "idle",
+          timeoutMs: WORKER_TIMEOUT_MS,
+          signal,
+        });
+        generation = await consume(signal?.aborted ? "" :
+          (await bb.sdk.threads.output({ threadId: worker.id, signal })).output ?? "",
+        );
+      }
+    } catch (error) {
+      if (!(error instanceof WorkerAdmissionTimeout)) throw error;
+      generation = result("worker_admission_timeout");
     } finally {
-      await disposeWorker(worker.id);
+      cleanupConfirmed = await disposeWorker(workerCleanup);
+      if (!cleanupConfirmed) stateFor(thread.id).unsettledWorker = workerCleanup;
     }
+    return cleanupConfirmed ? generation : { ...generation, reason: "worker_cleanup_unconfirmed" };
   };
 
   const generateForThread = async (
@@ -838,6 +1002,10 @@ export default async function plugin(bb: BbPluginApi) {
         if (slot === "aborted") return result("aborted");
         acquired = true;
         if (combinedSignal.aborted) return result("aborted");
+        if (state.unsettledWorker) {
+          if (!await disposeWorker(state.unsettledWorker)) return result("worker_cleanup_unconfirmed");
+          state.unsettledWorker = undefined;
+        }
         return await generateForThread(
           threadId,
           automatic,
@@ -853,7 +1021,7 @@ export default async function plugin(bb: BbPluginApi) {
         state.generationController = undefined;
         state.generationPromise = undefined;
         publishChanged({ threadId, generating: false });
-        if (state.retired || (!state.timer && !state.idleThread))
+        if (!state.unsettledWorker && (state.retired || (!state.timer && !state.idleThread)))
           states.delete(threadId);
       }
     })();
@@ -935,6 +1103,7 @@ export default async function plugin(bb: BbPluginApi) {
             if (
               !disposed &&
               latest &&
+              !latest.unsettledWorker &&
               latest.epoch === epoch &&
               latest.idleThread &&
               shouldRetryAutomaticRecap({
@@ -1166,6 +1335,10 @@ export default async function plugin(bb: BbPluginApi) {
           case "disposable_workers_unsupported":
             message = GENERATION_REASONS.disposable_workers_unsupported;
             break;
+          case "worker_admission_timeout":
+          case "worker_cleanup_unconfirmed":
+            message = GENERATION_REASONS[generation.reason];
+            break;
           default:
             message = `Could not generate a recap (${generation.reason ?? "unknown error"}).`;
         }
@@ -1196,7 +1369,7 @@ export default async function plugin(bb: BbPluginApi) {
       state.lastAutoUserRowId = null;
       state.idleThread = undefined;
       clearTimer(state);
-      if (!state.inFlight) states.delete(thread.id);
+      if (!state.inFlight && !state.unsettledWorker) states.delete(thread.id);
     }
   });
 
@@ -1226,7 +1399,7 @@ export default async function plugin(bb: BbPluginApi) {
       state.generationController?.abort();
       clearTimer(state);
       state.idleThread = undefined;
-      if (!state.inFlight) states.delete(thread.id);
+      if (!state.inFlight && !state.unsettledWorker) states.delete(thread.id);
     }
     reconsiderAncestors(thread);
   };
